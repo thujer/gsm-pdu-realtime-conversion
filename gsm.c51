@@ -1,0 +1,52 @@
+ /////////////////////////////////////////////////////////////////////////////////////
+ // +-----------------------------------------------------------------------------+ //
+ // |                              GSM driver with PDU                            | //
+ // |                             --------------------                            | //
+ // |                                Version 1.1a                                 | //
+ // +-----------------------------------------------------------------------------+ //
+ /////////////////////////////////////////////////////////////////////////////////////
+
+#define uchar unsigned char
+
+#include "uart.h"
+#include "pdu.h"
+#include "str.h"
+
+
+
+// -----------------------------------------------------------------------------------
+
+void gsm_init()
+{
+    pdu_init();
+}
+
+
+
+// +---------------------------------------------------------------+
+// | GSM process                                                   |
+// | uchar incoming_char ... incoming char from modem device       |
+// | bit pdu_decode      ... flag to turn PDU decode on            |
+// +---------------------------------------------------------------+
+void gsm_proc(uchar incoming_char, bit pdu_decode)
+{
+    // Pokud je aktivni dekodovani PDU kodu
+    if(pdu_decode)
+    {
+        if(uart_RIBUF)
+        {
+            if(is_hex(uart_RByte))
+            {
+                pdu_do_octet(incoming_char);                              // stradej znaky do oktetu
+
+                if(pdu_incoming_octet)                                    // oktet kompletni
+                {   
+                    pdu_incoming_message(pdu_octet_to_byte());     
+                    pdu_octet_reset();
+                    pdu_incoming_octet = 0;
+                }
+            }
+        }
+    }
+}
+

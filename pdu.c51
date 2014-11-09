@@ -1,0 +1,619 @@
+
+/////////////////////////////////////////////////////////////////////////////////////
+// +-----------------------------------------------------------------------------+ //
+// |                         PDU realtime conversion driver                      | //
+// |                        ---------------------------------                    | //
+// |                                Version 1.1a                                 | //
+// |                                                                             | //
+// +-----------------------------------------------------------------------------+ //
+// | Konverze PDU kodu do textu, vola se po zachyceni PDU oktetu, prevadi pouze  | //
+// | text, prvni byte urcujici cas, datum, odesilatele apod. je nutno odchytit   | //
+// | v nadrizenem procesu                                                        | //
+// +-----------------------------------------------------------------------------+ //
+/////////////////////////////////////////////////////////////////////////////////////
+
+#include <stdio.h>
+#include "pdu.h"
+
+//#define DEBUG_MESSAGES
+
+#define uchar unsigned char
+#define uint  unsigned int
+
+
+typedef enum {
+    PDU_SMS_INCOMING = 0,
+    PDU_SMS_OUTGOING = 1,
+};
+
+
+uchar ix_bit_rotate;               // Rotacni index
+uchar ix_bit_mask;                 // Maska
+uchar pdu_temp;                    // Posledni hodnota maskovanych bitu
+
+uchar idata pdu_text[5];           // Vystupni buffer pro konverzi z PDU
+uchar ix_pdu_text_r;               // index pro cteni
+uchar ix_pdu_text_w;               // index pro zapis
+uchar pdu_text_inbuf;              // Pocet byte v bufferu
+
+uchar pdu_octet_buf[3];            // oktet buffer
+bit   pdu_octet_full_flag;         // flag plneni oktetu, 1 = plni se horni byte, 0 = dolni byte
+bit   pdu_incoming_octet;          // flag cekajiciho oktetu v bufferu
+
+uchar pdu_message_state;           // state of PDU message process
+bit   pdu_sms_direction;           // smer SMS 0=incoming, 1=outgoing
+
+struct struct_gsm idata gsm;       // GSM structure instance
+
+uchar  pdu_smsc_ix;               // SMS centrum number index
+uchar  pdu_sender_ix;             // Sender number index
+uchar  pdu_text_ix;               // Text index
+
+
+
+// +--------------------------------------+
+// |        Vrati adresu oktetu           |
+// +--------------------------------------+
+/*
+char *pdu_get_octet()
+{
+    return(pdu_octet_buf);
+}
+*/
+
+
+// +--------------------------------------+
+// |   Sekvencni zapis byte do oktetu     |
+// +--------------------------------------+
+// Zapise byte z parametru na prislusnou pozici v oktet bufferu,
+// pri naplneni oktet bufferu nastavi priznak pdu_incoming_octet
+// a dale nezapisuje, dokud neni flag externe shozen
+// pokud prijde znak CR, je oktet povazovan za posledni a naplneny
+void pdu_do_octet(char byte)
+{
+    if(~pdu_incoming_octet)        
+    {
+        if((pdu_octet_full_flag) || (byte == '\r'))
+        {
+            pdu_octet_buf[1] = byte;              // zapis 2. byte oktetu 
+            pdu_octet_buf[2] = 0;                 // zapis konec bufferu oktetu 
+            pdu_octet_full_flag = 0;              // nuluj priznak plneho oktetu
+            pdu_incoming_octet = 1;               // nastav flag prichoziho oktetu
+            return;
+        }
+    
+        if(~pdu_octet_full_flag)
+        {
+            pdu_octet_buf[0] = byte;              // zapis 1. byte do bufferu oktetu
+            pdu_octet_full_flag = 1;              // nastav flag naplneni 1. oktetu
+        }
+    }
+}
+
+
+// +--------------------------------------+
+// |     Konverze hex znaku na cislo      |
+// +--------------------------------------+
+uchar pdu_hex_to_byte(char hexchar)
+{
+    uchar out;
+
+    if((hexchar >= '0') && (hexchar <= '9'))
+    {
+        out = (hexchar - '0');
+    }
+
+    if((hexchar >= 'A') && (hexchar <= 'F'))
+    {
+        out = (hexchar - 'A' + 10);
+    }
+
+    if((hexchar >= 'a') && (hexchar <= 'f'))
+    {
+        out = (hexchar - 'a' + 10);
+    }
+
+    return(out);
+}
+
+
+
+// +--------------------------------------+
+// |       Konverze oktetu do byte        |
+// +--------------------------------------+
+uchar pdu_octet_to_byte()
+{
+    uchar out;
+    
+    //if(Octet[1]=='F') Octet[1]=0;   // Pokud je F, byl je v oktetu pouze jeden znak
+
+    out  = pdu_hex_to_byte(pdu_octet_buf[0]) * 0x10;
+    out += pdu_hex_to_byte(pdu_octet_buf[1]);
+    
+    return(out);
+}
+
+
+
+
+// +--------------------------------------+
+// |       Prohozeni byte v oktetu        |
+// +--------------------------------------+
+void pdu_octet_swap(void)
+{
+    uchar temp;
+    
+    temp = pdu_octet_buf[0];
+    pdu_octet_buf[0] = pdu_octet_buf[1];
+    pdu_octet_buf[1] = temp;
+}
+
+
+// +--------------------------------------+
+// |       Prohozeni byte v pdu_byte      |
+// +--------------------------------------+
+void pdu_byte_swap(char *byte)
+{
+    uchar temp;
+
+    temp = (*byte & ~15) >> 4;               // zkopiruj horni nible a posun ho na spodni
+    
+    *byte = ((*byte & 15) << 4) | temp;  // posun dolni nible na uroven horniho, pridej spodni
+}
+
+
+// +--------------------------------------+
+// |        Init oktet bufferu            |
+// +--------------------------------------+
+void pdu_octet_reset()
+{
+    pdu_octet_buf[0] = 0;
+    pdu_octet_buf[1] = 0;
+    pdu_octet_buf[2] = 0;                 // zapis konec bufferu oktetu 
+    pdu_octet_full_flag = 0;
+    pdu_incoming_octet = 0; 
+}
+
+
+
+
+// +--------------------------------------+
+// |     Cteni znaku z PDU bufferu        |
+// +--------------------------------------+
+uchar pdu_getchar()
+{
+    uchar out;
+    
+    out=0;
+
+    if(pdu_text_inbuf)
+    {
+        ix_pdu_text_r %= sizeof(pdu_text);          // rotuj index pro cteni z buf
+        out = pdu_text[ix_pdu_text_r];              // Nacti znak z bufferu
+        ix_pdu_text_r++;                            // Index na dalsi znak
+        pdu_text_inbuf--;                           // O 1 prvek v bufferu mene
+    }
+
+    return(out);
+}
+
+
+
+// +--------------------------------------+
+// |      Zapis znaku do PDU bufferu      |
+// +--------------------------------------+
+uchar pdu_putchar(uchar Ch)
+{
+    if(pdu_text_inbuf < sizeof(pdu_text))
+    {
+        ix_pdu_text_w %= sizeof(pdu_text);          // Rotuj index pro zapis do buf
+        pdu_text[ix_pdu_text_w] = Ch;               // Zapis znak do bufferu
+        ix_pdu_text_w++;                            // Index na dalsi znak
+        pdu_text_inbuf++;                           // O 1 prvek v bufferu mene
+        return(1);
+    }
+    else
+        return(0);
+}
+
+
+// +--------------------------------------+
+// |  Sekvencni prevod PDU dat na text    |
+// +--------------------------------------+
+// Pred zahajenim nutno externe provest inicializaci, jinak by bylo pocitano s predchozimi daty
+void pdu_to_text(uchar src)
+{
+    uchar out;
+
+    // Init
+    if(ix_bit_rotate == 0xFF)
+    {
+        ix_bit_rotate = 0;            // Rotuj rotacni index
+        ix_bit_mask = 128;            // Resetuj masku
+    }
+
+    if(ix_bit_rotate >= 7)
+    {
+        pdu_putchar(pdu_temp & 127);  // zapis do PDU bufferu znak ve spodnich 7 bitech
+        pdu_temp = 0;                 // Nuluj 
+        ix_bit_rotate = 0;            // Rotuj rotacni index
+        ix_bit_mask = 128;            // Resetuj masku
+    }
+
+    // Negativni maska zdoje, rotace, doplneni spodnich bitu, maskovani spodnich 7 bitu
+    out = ((((src & (0xFF - ix_bit_mask)) << ix_bit_rotate) | pdu_temp) & 0x7F);   
+
+    pdu_temp=((src & ix_bit_mask) >> (7-ix_bit_rotate));           // Rotuj bity na zacatek
+
+    ix_bit_mask = ((ix_bit_mask >> 1) | 128);
+    ix_bit_rotate++;
+
+    pdu_putchar(out);
+}
+
+
+
+// +--------------------------------------+
+// |  Sekvencni prevod textu na PDU data  |
+// +--------------------------------------+
+// Pred zahajenim nutno externe provest inicializaci, jinak by bylo pocitano s predchozimi daty
+// Po skonceni provest flush, aby byl zapsan i posledni nekompletni oktet
+/*
+void text_to_pdu(uchar src)
+{
+    uchar out;
+    
+    // Init
+    if(ix_bit_rotate == 0xFF)
+    {
+        ix_bit_rotate=0;              // Rotuj rotacni index
+        ix_bit_mask=127;              // Resetuj masku
+    }
+    
+    if(ix_bit_rotate > 7)
+    {
+        ix_bit_rotate=0;              // Rotuj rotacni index
+        ix_bit_mask=127;              // Resetuj masku
+        pdu_temp=0;
+    }
+
+    out = (pdu_temp | ((uchar)(src & (0xFF-ix_bit_mask)) << (8-ix_bit_rotate)));
+    pdu_temp = ((src & ix_bit_mask) >> ix_bit_rotate);
+
+    ix_bit_mask = (ix_bit_mask << 1);  // Rotace masky
+    ix_bit_rotate++;
+    
+    if(ix_bit_rotate != 1)
+    {
+        pdu_putchar(out);
+    }
+}
+*/
+
+
+// NOTE: after call this, must be called  pdu_octet_reset();            
+void pdu_incoming_message(uchar pdu_byte)
+{
+    switch(pdu_message_state)
+    {
+        case 1: 
+            // pocet byte nasledujici informace
+            gsm.smsc_number_size = pdu_byte;
+            pdu_message_state++;
+
+            #ifdef DEBUG_MESSAGES
+            printf("\r\nNumSize: %d\r\n", (int) gsm.smsc_number_size);
+            #endif
+            break;   
+
+        case 2:
+            // format cisla centra 81=mezinarodni, 91=narodni
+            gsm.smsc_number_format = pdu_byte;
+            pdu_smsc_ix = 0;                        // nuluj index
+            pdu_message_state++;
+
+            #ifdef DEBUG_MESSAGES
+            printf("NumFormat: %X\r\n", (int) gsm.smsc_number_format);
+            #endif
+            break;   
+
+        case 3:
+            // cislo SMS centra
+            if((pdu_smsc_ix < (gsm.smsc_number_size*2 - 2)) &&
+               (pdu_smsc_ix < (sizeof(gsm.smsc)-1)))
+            {
+                pdu_octet_swap();                                 // Prohozeni byte v oktetu
+                gsm.smsc[pdu_smsc_ix    ] = pdu_octet_buf[0];     // Zapis znak do cisla centra
+                gsm.smsc[pdu_smsc_ix + 1] = pdu_octet_buf[1];
+                pdu_smsc_ix += 2;                                 // Posun index o dve pozice
+
+                #ifdef DEBUG_MESSAGES
+                printf("SMSCNum: [%s] %d / %d\r\n", pdu_octet_buf, (int) pdu_smsc_ix, (int) (gsm.smsc_number_size*2 - 2));
+                #endif
+
+                if(pdu_smsc_ix >= (gsm.smsc_number_size*2 - 2))
+                {
+                    // Pokud je cislo naplneno pokracuj dalsim stavem
+                    pdu_message_state++;
+                }
+            }
+            else
+            {
+                pdu_message_state++;        // Pokud oktet naplnen pokracuj dalsim stavem
+            }
+            break;
+
+        case 4:
+            // Stavove informace SMS
+            gsm.sms_deliver_submit = pdu_byte;
+            pdu_message_state++;
+
+            #ifdef DEBUG_MESSAGES
+            printf("SMS deliver: %X\r\n", (int) gsm.sms_deliver_submit);
+            #endif
+            break;
+            
+        case 5:
+            // Delka cisla odesilatele ( > 0 = prijata SMS, 0 = SMS k odeslani
+            gsm.sender_num_size = pdu_byte;
+
+            #ifdef DEBUG_MESSAGES
+            printf("RSndrNumLng: %d\r\n", (int) gsm.sender_num_size);
+            #endif
+            //pdu_octet_reset();                              // Nuluj oktet
+            
+            if(!gsm.sender_num_size)
+            {
+                pdu_sms_direction = PDU_SMS_OUTGOING; 
+                gsm.tp_msg_ref = gsm.sender_num_size;
+                pdu_message_state++;
+            }
+            else
+            {
+                pdu_message_state += 2;
+            }
+            break;
+
+        case 6:
+            // Delka cisla odesilatele - SMS k odeslani
+            gsm.sender_num_size = pdu_byte;      
+            pdu_message_state++;
+
+            #ifdef DEBUG_MESSAGES
+            printf("SSndrNumLng: %d\r\n", (int) gsm.sender_num_size);
+            #endif
+            break;
+
+        case 7:
+            // Format cisla odesilatele
+            gsm.sender_num_format = pdu_byte;
+            pdu_sender_ix = 0;                              // nuluj index
+            pdu_message_state++;
+
+            #ifdef DEBUG_MESSAGES
+            printf("SndrFormat: %X\r\n", (int) gsm.sender_num_format);
+            #endif
+            break;
+
+        case 8:
+            if((pdu_sender_ix < (gsm.sender_num_size+1)) && (pdu_sender_ix < (sizeof(gsm.sender_num)-1)))
+            {
+                 pdu_octet_swap();                                   // Prohozeni byte v oktetu
+                 gsm.sender_num[pdu_sender_ix  ] = pdu_octet_buf[0];     // Zapis znak do cisla centra
+                 gsm.sender_num[pdu_sender_ix+1] = pdu_octet_buf[1];
+
+                 if(gsm.sender_num[pdu_sender_ix+1] == 'F') gsm.sender_num[pdu_sender_ix+1] = 0;
+
+                 pdu_sender_ix+=2;                             // Posun index o dve pozice
+
+                 #ifdef DEBUG_MESSAGES
+                 printf("SndNum: [%s] %d / %d\r\n", pdu_octet_buf, (int) pdu_sender_ix, (int) gsm.sender_num_size);
+                 #endif
+
+                 pdu_octet_reset();
+
+                 if(pdu_sender_ix >= gsm.sender_num_size)
+                 {
+                   pdu_message_state++;        // Pokud oktet naplnen pokracuj dalsim stavem
+                 }
+            }
+            else
+            {
+                 pdu_octet_reset();
+                 pdu_message_state++;        // Pokud oktet naplnen pokracuj dalsim stavem
+            }
+            break;
+
+        case 9:
+            // PID - typ zpravy
+            //  00h - obycejná SMS zpráva (implicitní hodnota)
+            //  01h - telex
+            //  02h - fax (skupina3)
+            //  03h - fax (skupina 4)
+            //  04h - normální telefon (tj. konverze do hlasu)
+            // pokracuj dalsim stavem
+
+            gsm.pid = pdu_byte;              
+            pdu_message_state++;        // Pokud oktet naplnen pokracuj dalsim stavem
+
+            #ifdef DEBUG_MESSAGES
+            printf("PID: %X\r\n", (int) gsm.pid);
+            #endif
+            break;
+
+        case 10:
+            // Kodovani textu SMS
+            //  DCS (Data Coding Scheme) urèuje kódovací schéma dat. Napø.:
+            //  00h - 7 bitová výchozí abeceda
+            //  F6h - 8 bitové datové kódování dle Class 2
+            // pokracuj dalsim stavem
+
+            gsm.dcs = pdu_byte;         // Kodovaci schema textu SMS
+            pdu_message_state++;        // Pokud oktet naplnen pokracuj dalsim stavem
+
+            #ifdef DEBUG_MESSAGES
+            printf("DCS: %X\r\n", (int) gsm.dcs);
+            #endif
+            break;
+
+        case 11:
+             // Dalsi oktety jsou TimeStamp v pripade prichozi SMS, nebo ValidityPeriod v pripade odchozi SMS
+             //  10210390606504
+             //  06052312582708 -> 06/05/23 12:58:27
+             //  SCTS - definuje datum doruèení SMS do SMSCentra. Jednotlivé dvojce èísel, zleva doprava urèují:
+             //  rok, mìsíc, den, hodinu, minutu, sekundu, èasovou zónu.
+             //  Èísla ve dvojicích jsou opìt prohozena (swap). Pro ukázku platí: 30.12.2001, 09:06:56.
+             //  Údaj v poslední dvojici èísel urèuje rozdíl ve ètvrt hodinách mezi místním èasem a GTM (Greenwich Main Time).
+
+            if(pdu_sms_direction == PDU_SMS_OUTGOING)
+            {
+                gsm.validity_period = pdu_byte;             // doba platnosti z oktetu
+
+                #ifdef DEBUG_MESSAGES
+                printf("ValPer: %X\r\n", (int) gsm.validity_period);
+                #endif
+
+                pdu_message_state = 18;                     // Preskoc datum a cas
+            }
+            else
+            {
+                pdu_byte_swap(&pdu_byte);                   // Prohozeni nibble v pdu_byte
+                gsm.date_year = pdu_byte;                   // Rok doruceni SMS do centra
+                pdu_message_state++;                        // Pokud oktet naplnen pokracuj dalsim stavem
+
+                #ifdef DEBUG_MESSAGES
+                printf("Year: %d\r\n", (int) gsm.date_year);
+                #endif
+            }
+            break;
+
+        case 12:
+             pdu_byte_swap(&pdu_byte);                     // Prohozeni nibble v pdu_byte
+             gsm.date_month = pdu_byte;                    // Mesic doruceni SMS do centra
+             pdu_message_state++;                          // Pokud oktet naplnen pokracuj dalsim stavem
+
+             #ifdef DEBUG_MESSAGES
+             printf("Month: %d\r\n", (int) gsm.date_month);
+             #endif
+             break;
+
+        case 13:
+             pdu_byte_swap(&pdu_byte);                     // Prohozeni nibble v pdu_byte
+             gsm.date_day = pdu_byte;                      // Den doruceni SMS do centra
+             pdu_message_state++;                          // Pokud oktet naplnen pokracuj dalsim stavem
+
+             #ifdef DEBUG_MESSAGES
+             printf("Day: %d\r\n", (int) gsm.date_day);
+             #endif
+             break;
+
+        case 14:
+             pdu_byte_swap(&pdu_byte);                     // Prohozeni nibble v pdu_byte
+             gsm.date_hour = pdu_byte;                     // Hodina doruceni SMS do centra
+             pdu_message_state++;                          // Pokud oktet naplnen pokracuj dalsim stavem
+
+             #ifdef DEBUG_MESSAGES
+             printf("Hour: %d\r\n", (int) gsm.date_hour);
+             #endif
+             break;
+
+        case 15:
+             pdu_byte_swap(&pdu_byte);                     // Prohozeni nibble v pdu_byte
+             gsm.date_minute = pdu_byte;                   // Minuta doruceni SMS do centra
+             pdu_message_state++;                          // Pokud oktet naplnen pokracuj dalsim stavem
+
+             #ifdef DEBUG_MESSAGES
+             printf("Min: %d\r\n", (int) gsm.date_minute);
+             #endif
+             break;
+
+        case 16:
+             pdu_byte_swap(&pdu_byte);                     // Prohozeni nibble v pdu_byte
+             gsm.date_second = pdu_byte;                   // Den doruceni SMS do centra
+             pdu_message_state++;                         
+
+             #ifdef DEBUG_MESSAGES
+             printf("Sec: %d\r\n", (int) gsm.date_second);
+             #endif
+             break;
+
+        case 17:
+             pdu_byte_swap(&pdu_byte);                     // Prohozeni nibble v pdu_byte
+             gsm.date_greenwitch_diff = pdu_byte;             // Rozdil casu oproti Greenwitch
+             pdu_message_state++;                             // Pokud oktet naplnen pokracuj dalsim stavem
+
+             #ifdef DEBUG_MESSAGES
+             printf("Grnwtch: %d\r\n", (int) gsm.date_greenwitch_diff);
+             #endif
+             break;
+
+        case 18:
+             // Dalsi oktet je
+             //  UDL - udava pocet znaku v nasledujici zprave pred jejim zakodovanim.
+             //  Tzn. ze pokud je pouzito vychozi 7 - bitove kodovani tak muze byt pocet
+             //  byte mensi nez pocet znaku, ktere udava UDL. Pri 8 - bitovem kodovani
+             //  je pocet byte a znaku ve zprave totozny
+
+             gsm.text_size = pdu_byte;                        // Delka textu SMS
+
+             #ifdef DEBUG_MESSAGES
+             printf("TextLng: %d\r\n", (int) gsm.text_size);
+             #endif
+
+             if(gsm.dcs == 0)
+             {
+                 gsm.text_size = (uchar) (((int)(gsm.text_size * 7) / 8) + 1);
+             }
+
+             pdu_octet_reset();                                  // Nuluj oktet
+
+             //pdu_init();                                         // Init konverze PDU do textu
+
+             pdu_text_ix = 0;
+             pdu_message_state++;                                // Pokud oktet naplnen pokracuj dalsim stavem
+             break;
+
+        case  19:
+             // Dalsi oktety jsou text SMS
+
+             if(pdu_text_ix < gsm.text_size)
+             {
+                 pdu_to_text(pdu_byte);                          // Text SMS -> Dekoduj do bufferu
+                 pdu_text_ix++;                                  // posun index textu
+             }
+             else
+             {
+                 pdu_message_state = 0;                          // Ukonci proces rozpoznavani PDU zpravy
+             }
+             break;
+
+    }
+}
+
+
+
+
+// +--------------------------------------+
+// |           Init promennych            |
+// +--------------------------------------+
+void pdu_init()
+{
+    pdu_octet_reset();
+
+    ix_pdu_text_r = 0;
+    ix_pdu_text_w = 0;
+    pdu_text_inbuf = 0;
+    pdu_temp = 0;
+    
+    ix_bit_rotate = 0xFF;                          // Hodnota pro Init vlastni funkci
+
+    pdu_message_state = 1;                         // cekej na zpravu
+    pdu_smsc_ix = 0;
+    pdu_sender_ix = 0;
+    pdu_text_ix = 0;
+    pdu_sms_direction = PDU_SMS_INCOMING;
+
+}
+
+
+
